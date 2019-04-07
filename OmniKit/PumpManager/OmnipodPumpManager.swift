@@ -79,6 +79,7 @@ extension OmnipodPumpManagerError: LocalizedError {
 
 
 public class OmnipodPumpManager: RileyLinkPumpManager, PumpManager {
+
     public func roundToSupportedBasalRate(unitsPerHour: Double) -> Double {
         return supportedBasalRates.filter({$0 <= unitsPerHour}).max() ?? 0
     }
@@ -157,6 +158,14 @@ public class OmnipodPumpManager: RileyLinkPumpManager, PumpManager {
         for observer in podStateObservers {
             observer.podStateDidUpdate(podState)
         }
+    }
+
+    /// Returns a dose estimator for the current bolus, if one is in progress
+    public func createBolusProgressReporter(reportingOn dispatchQueue: DispatchQueue) -> DoseProgressReporter? {
+        if case .inProgress(let dose) = bolusState {
+            return PodDoseProgressEstimator(dose: dose, reportingQueue: dispatchQueue)
+        }
+        return nil
     }
 
     /// TODO: Isolate to queue
@@ -264,26 +273,40 @@ public class OmnipodPumpManager: RileyLinkPumpManager, PumpManager {
             )
         }
     }
-    
-    private var basalDeliveryStateTransitioning: Bool = false {
+
+    private enum SuspendTransition {
+        case suspending
+        case resuming
+    }
+
+    // TODO: Accessed and set on different threads
+    private var suspendTransition: SuspendTransition? {
         didSet {
             notifyStatusObservers()
         }
     }
-    
+
     private var basalDeliveryState: PumpManagerStatus.BasalDeliveryState {
         guard let podState = state.podState else {
-            return .active
+            return .suspended
         }
-        
-        if basalDeliveryStateTransitioning {
-            return podState.suspended ? .resuming : .suspending
-        } else {
+
+        switch suspendTransition {
+        case .suspending?:
+            return .suspending
+        case .resuming?:
+            return .resuming
+        case .none:
             return podState.suspended ? .suspended : .active
         }
     }
-    
-    private var bolusStateTransitioning: Bool = false {
+
+    private enum BolusTransition {
+        case initiating
+        case canceling
+    }
+
+    private var bolusTransition: BolusTransition? {
         didSet {
             notifyStatusObservers()
         }
@@ -293,12 +316,18 @@ public class OmnipodPumpManager: RileyLinkPumpManager, PumpManager {
         guard let podState = state.podState else {
             return .none
         }
-        
-        if let bolus = podState.unfinalizedBolus, !bolus.finished {
-            // TODO: return progress
-            return bolusStateTransitioning ? .canceling : .inProgress(Float(bolus.progress))
-        } else {
-            return bolusStateTransitioning ? .initiating : .none
+
+        switch bolusTransition {
+        case .initiating?:
+            return .initiating
+        case .canceling?:
+            return .canceling
+        case .none:
+            if let bolus = podState.unfinalizedBolus, !bolus.finished {
+                return .inProgress(DoseEntry(bolus))
+            } else {
+                return .none
+            }
         }
     }
     
@@ -623,19 +652,20 @@ public class OmnipodPumpManager: RileyLinkPumpManager, PumpManager {
                     return
                 }
                 
-                defer { self.basalDeliveryStateTransitioning = false }
-                self.basalDeliveryStateTransitioning = true
+                defer { self.suspendTransition = .none }
+                self.suspendTransition = .suspending
 
-                do {
-                    let _ = try session.cancelDelivery(deliveryType: .all, beepType: .noBeep)
+                let result = session.cancelDelivery(deliveryType: .all, beepType: .noBeep)
+                switch result {
+                case .certainFailure(let error):
+                    completion(error)
+                case .uncertainFailure(let error):
+                    completion(error)
+                case .success:
                     completion(nil)
-                    
                     session.dosesForStorage() { (doses) -> Bool in
                         return self.store(doses: doses)
                     }
-
-                } catch (let error) {
-                    completion(error)
                 }
             }
         }
@@ -659,8 +689,8 @@ public class OmnipodPumpManager: RileyLinkPumpManager, PumpManager {
                     return
                 }
                 
-                defer { self.basalDeliveryStateTransitioning = false }
-                self.basalDeliveryStateTransitioning = true
+                defer { self.suspendTransition = .none }
+                self.suspendTransition = .resuming
                 
                 do {
                     let scheduleOffset = self.state.timeZone.scheduleOffset(forDate: Date())
@@ -749,8 +779,8 @@ public class OmnipodPumpManager: RileyLinkPumpManager, PumpManager {
                     return
                 }
                 
-                defer { self.bolusStateTransitioning = false }
-                self.bolusStateTransitioning = true
+                defer { self.bolusTransition = nil }
+                self.bolusTransition = .initiating
                 
                 let date = Date()
                 let endDate = date.addingTimeInterval(enactUnits / Pod.bolusDeliveryRate)
@@ -770,7 +800,50 @@ public class OmnipodPumpManager: RileyLinkPumpManager, PumpManager {
             }
         }
     }
-    
+
+    public func cancelBolus(completion: @escaping (PumpManagerResult<DoseEntry?>) -> Void) {
+        queue.async {
+            guard self.hasActivePod else {
+                completion(.failure(OmnipodPumpManagerError.noPodPaired))
+                return
+            }
+
+            let rileyLinkSelector = self.rileyLinkDeviceProvider.firstConnectedDevice
+            self.podComms.runSession(withName: "Cancel Bolus", using: rileyLinkSelector) { (result) in
+
+                let session: PodCommsSession
+                switch result {
+                case .success(let s):
+                    session = s
+                case .failure(let error):
+                    completion(.failure(error))
+                    return
+                }
+
+                do {
+                    defer { self.bolusTransition = nil }
+                    self.bolusTransition = .canceling
+
+                    let result = session.cancelDelivery(deliveryType: .bolus, beepType: .noBeep)
+                    switch result {
+                    case .certainFailure(let error):
+                        throw error
+                    case .uncertainFailure(let error):
+                        throw error
+                    case .success(_, let canceledBolus):
+                        let canceledDoseEntry: DoseEntry? = canceledBolus != nil ? DoseEntry(canceledBolus!) : nil
+                        completion(.success(canceledDoseEntry))
+                        session.dosesForStorage() { (doses) -> Bool in
+                            return self.store(doses: doses)
+                        }
+                    }
+                } catch (let error) {
+                    completion(.failure(error))
+                }
+            }
+        }
+    }
+
     public func enactTempBasal(unitsPerHour: Double, for duration: TimeInterval, completion: @escaping (PumpManagerResult<DoseEntry>) -> Void) {
         queue.async {
             guard let podState = self.state.podState, self.hasActivePod else {
@@ -803,8 +876,17 @@ public class OmnipodPumpManager: RileyLinkPumpManager, PumpManager {
                         self.log.info("Canceling temp basal because podState indicates unfinalized bolus in progress.")
                         throw PodCommsError.unfinalizedBolus
                     }
-                    
-                    let status = try session.cancelDelivery(deliveryType: .tempBasal, beepType: .noBeep)
+
+                    let status: StatusResponse
+                    let result = session.cancelDelivery(deliveryType: .tempBasal, beepType: .noBeep)
+                    switch result {
+                    case .certainFailure(let error):
+                        throw error
+                    case .uncertainFailure(let error):
+                        throw error
+                    case .success(let cancelTempStatus,_):
+                        status = cancelTempStatus
+                    }
 
                     guard !status.deliveryStatus.bolusing else {
                         throw PodCommsError.unfinalizedBolus
@@ -901,7 +983,15 @@ public class OmnipodPumpManager: RileyLinkPumpManager, PumpManager {
                     switch result {
                     case .success(let session):
                         let scheduleOffset = timeZone.scheduleOffset(forDate: Date())
-                        let _ = try session.cancelDelivery(deliveryType: .all, beepType: .noBeep)
+                        let result = session.cancelDelivery(deliveryType: .all, beepType: .noBeep)
+                        switch result {
+                        case .certainFailure(let error):
+                            throw error
+                        case .uncertainFailure(let error):
+                            throw error
+                        case .success:
+                            break
+                        }
                         let _ = try session.setBasalSchedule(schedule: schedule, scheduleOffset: scheduleOffset, confidenceReminder: false, programReminderInterval: 0)
                         self.state.basalSchedule = schedule
                         completion(nil)

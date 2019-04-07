@@ -48,6 +48,8 @@ public struct PodState: RawRepresentable, Equatable, CustomDebugStringConvertibl
     public var lastInsulinMeasurements: PodInsulinMeasurements?
     public var unfinalizedBolus: UnfinalizedDose?
     public var unfinalizedTempBasal: UnfinalizedDose?
+    public var unfinalizedSuspend: UnfinalizedDose?
+    public var unfinalizedResume: UnfinalizedDose?
     var finalizedDoses: [UnfinalizedDose]
     public private(set) var suspended: Bool
     public var fault: PodInfoFaultEvent?
@@ -66,10 +68,6 @@ public struct PodState: RawRepresentable, Equatable, CustomDebugStringConvertibl
         return active
     }
     
-    public var deliveryScheduleUncertain: Bool {
-        return unfinalizedBolus?.scheduledCertainty == .uncertain || unfinalizedTempBasal?.scheduledCertainty == .uncertain
-    }
-    
     public init(address: UInt32, activatedAt: Date, expiresAt: Date, piVersion: String, pmVersion: String, lot: UInt32, tid: UInt32) {
         self.address = address
         self.nonceState = NonceState(lot: lot, tid: tid)
@@ -80,8 +78,6 @@ public struct PodState: RawRepresentable, Equatable, CustomDebugStringConvertibl
         self.lot = lot
         self.tid = tid
         self.lastInsulinMeasurements = nil
-        self.unfinalizedBolus = nil
-        self.unfinalizedTempBasal = nil
         self.finalizedDoses = []
         self.suspended = false
         self.fault = nil
@@ -118,7 +114,7 @@ public struct PodState: RawRepresentable, Equatable, CustomDebugStringConvertibl
     public mutating func resyncNonce(syncWord: UInt16, sentNonce: UInt32, messageSequenceNum: Int) {
         let sum = (sentNonce & 0xffff) + UInt32(crc16Table[messageSequenceNum]) + (lot & 0xffff) + (tid & 0xffff)
         let seed = UInt16(sum & 0xffff) ^ syncWord
-        nonceState = NonceState(lot: lot, tid: tid, seed: UInt8(seed & 0xff))
+        nonceState = NonceState(lot: lot, tid: tid, seed: seed)
     }
     
     public mutating func updateFromStatusResponse(_ response: StatusResponse) {
@@ -134,8 +130,8 @@ public struct PodState: RawRepresentable, Equatable, CustomDebugStringConvertibl
     private mutating func updateDeliveryStatus(deliveryStatus: StatusResponse.DeliveryStatus) {
         let now = Date()
         
-        if let bolus = unfinalizedBolus {
-            if bolus.finishTime <= now {
+        if let bolus = unfinalizedBolus, let finishTime = bolus.finishTime {
+            if finishTime <= now {
                 finalizedDoses.append(bolus)
                 unfinalizedBolus = nil
             } else if bolus.scheduledCertainty == .uncertain {
@@ -149,8 +145,8 @@ public struct PodState: RawRepresentable, Equatable, CustomDebugStringConvertibl
             }
         }
 
-        if let tempBasal = unfinalizedTempBasal {
-            if tempBasal.finishTime <= now {
+        if let tempBasal = unfinalizedTempBasal, let finishTime = tempBasal.finishTime {
+            if finishTime <= now {
                 finalizedDoses.append(tempBasal)
                 unfinalizedTempBasal = nil
             } else if tempBasal.scheduledCertainty == .uncertain {
@@ -163,7 +159,36 @@ public struct PodState: RawRepresentable, Equatable, CustomDebugStringConvertibl
                 }
             }
         }
-        
+
+        if let resume = unfinalizedResume, resume.scheduledCertainty == .uncertain {
+            if deliveryStatus != .suspended {
+                // Resume was enacted
+                unfinalizedResume?.scheduledCertainty = .certain
+            } else {
+                // Resume wasn't enacted
+                unfinalizedResume = nil
+            }
+        }
+
+        if let suspend = unfinalizedSuspend {
+            if suspend.scheduledCertainty == .uncertain {
+                if deliveryStatus == .suspended {
+                    // Suspend was enacted
+                    unfinalizedSuspend?.scheduledCertainty = .certain
+                } else {
+                    // Suspend wasn't enacted
+                    unfinalizedSuspend = nil
+                }
+            }
+
+            if let resume = unfinalizedResume, suspend.startTime < resume.startTime {
+                finalizedDoses.append(suspend)
+                finalizedDoses.append(resume)
+                unfinalizedSuspend = nil
+                unfinalizedResume = nil
+            }
+        }
+
         suspended = deliveryStatus == .suspended
     }
 
@@ -214,7 +239,23 @@ public struct PodState: RawRepresentable, Equatable, CustomDebugStringConvertibl
         } else {
             self.unfinalizedTempBasal = nil
         }
-        
+
+        if let rawUnfinalizedSuspend = rawValue["unfinalizedSuspend"] as? UnfinalizedDose.RawValue,
+            let unfinalizedSuspend = UnfinalizedDose(rawValue: rawUnfinalizedSuspend)
+        {
+            self.unfinalizedSuspend = unfinalizedSuspend
+        } else {
+            self.unfinalizedSuspend = nil
+        }
+
+        if let rawUnfinalizedResume = rawValue["unfinalizedResume"] as? UnfinalizedDose.RawValue,
+            let unfinalizedResume = UnfinalizedDose(rawValue: rawUnfinalizedResume)
+        {
+            self.unfinalizedResume = unfinalizedResume
+        } else {
+            self.unfinalizedResume = nil
+        }
+
         if let rawLastInsulinMeasurements = rawValue["lastInsulinMeasurements"] as? PodInsulinMeasurements.RawValue {
             self.lastInsulinMeasurements = PodInsulinMeasurements(rawValue: rawLastInsulinMeasurements)
         } else {
@@ -301,7 +342,15 @@ public struct PodState: RawRepresentable, Equatable, CustomDebugStringConvertibl
         if let unfinalizedTempBasal = self.unfinalizedTempBasal {
             rawValue["unfinalizedTempBasal"] = unfinalizedTempBasal.rawValue
         }
-        
+
+        if let unfinalizedSuspend = self.unfinalizedSuspend {
+            rawValue["unfinalizedSuspend"] = unfinalizedSuspend.rawValue
+        }
+
+        if let unfinalizedResume = self.unfinalizedResume {
+            rawValue["unfinalizedResume"] = unfinalizedResume.rawValue
+        }
+
         if let lastInsulinMeasurements = self.lastInsulinMeasurements {
             rawValue["lastInsulinMeasurements"] = lastInsulinMeasurements.rawValue
         }
@@ -338,6 +387,8 @@ public struct PodState: RawRepresentable, Equatable, CustomDebugStringConvertibl
             "* suspended: \(suspended)",
             "* unfinalizedBolus: \(String(describing: unfinalizedBolus))",
             "* unfinalizedTempBasal: \(String(describing: unfinalizedTempBasal))",
+            "* unfinalizedSuspend: \(String(describing: unfinalizedSuspend))",
+            "* unfinalizedResume: \(String(describing: unfinalizedResume))",
             "* finalizedDoses: \(String(describing: finalizedDoses))",
             "* activeAlerts: \(String(describing: activeAlerts))",
             "* messageTransportState: \(String(describing: messageTransportState))",
@@ -357,8 +408,8 @@ fileprivate struct NonceState: RawRepresentable, Equatable {
     var table: [UInt32]
     var idx: UInt8
     
-    public init(lot: UInt32 = 0, tid: UInt32 = 0, seed: UInt8 = 0) {
-        table = Array(repeating: UInt32(0), count: 21)
+    public init(lot: UInt32 = 0, tid: UInt32 = 0, seed: UInt16 = 0) {
+        table = Array(repeating: UInt32(0), count: 2 + 16)
         table[0] = (lot & 0xFFFF) + 0x55543DC3 + (lot >> 16)
         table[0] = table[0] & 0xFFFFFFFF
         table[1] = (tid & 0xFFFF) + 0xAAAAE44E + (tid >> 16)
@@ -366,7 +417,8 @@ fileprivate struct NonceState: RawRepresentable, Equatable {
         
         idx = 0
         
-        table[0] += UInt32(seed)
+        table[0] += UInt32((seed & 0x00ff))
+        table[1] += UInt32((seed & 0xff00) >> 8)
         
         for i in 0..<16 {
             table[2 + i] = generateEntry()
@@ -378,7 +430,7 @@ fileprivate struct NonceState: RawRepresentable, Equatable {
     private mutating func generateEntry() -> UInt32 {
         table[0] = ((table[0] >> 16) + (table[0] & 0xFFFF) * 0x5D7F) & 0xFFFFFFFF
         table[1] = ((table[1] >> 16) + (table[1] & 0xFFFF) * 0x8CA0) & 0xFFFFFFFF
-        return UInt32((UInt64(table[1]) + (UInt64(table[0]) << 16)) & 0xFFFFFFFF)
+        return UInt32((UInt64(table[1]) + (UInt64((table[0]) & 0xFFFF) << 16)) & 0xFFFFFFFF)
     }
     
     public mutating func advanceToNextNonce() {
