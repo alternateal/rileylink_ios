@@ -38,8 +38,12 @@ public struct PodState: RawRepresentable, Equatable, CustomDebugStringConvertibl
     
     public let address: UInt32
     fileprivate var nonceState: NonceState
-    public let activatedAt: Date
-    public let expiresAt: Date
+    public var activatedAt: Date?
+
+    public var expiresAt: Date? {
+        return activatedAt?.addingTimeInterval(Pod.serviceDuration - Pod.endOfServiceImminentWindow - Pod.expirationAdvisoryWindow)
+    }
+
     public let piVersion: String
     public let pmVersion: String
     public let lot: UInt32
@@ -82,11 +86,9 @@ public struct PodState: RawRepresentable, Equatable, CustomDebugStringConvertibl
         return active
     }
     
-    public init(address: UInt32, activatedAt: Date, expiresAt: Date, piVersion: String, pmVersion: String, lot: UInt32, tid: UInt32) {
+    public init(address: UInt32, piVersion: String, pmVersion: String, lot: UInt32, tid: UInt32) {
         self.address = address
         self.nonceState = NonceState(lot: lot, tid: tid)
-        self.activatedAt = activatedAt
-        self.expiresAt = expiresAt
         self.piVersion = piVersion
         self.pmVersion = pmVersion
         self.lot = lot
@@ -132,6 +134,9 @@ public struct PodState: RawRepresentable, Equatable, CustomDebugStringConvertibl
     }
     
     public mutating func updateFromStatusResponse(_ response: StatusResponse) {
+        if activatedAt == nil {
+            self.activatedAt = Date() - response.timeActive
+        }
         updateDeliveryStatus(deliveryStatus: response.deliveryStatus)
         lastInsulinMeasurements = PodInsulinMeasurements(statusResponse: response, validTime: Date())
         activeAlertSlots = response.alerts
@@ -213,8 +218,6 @@ public struct PodState: RawRepresentable, Equatable, CustomDebugStringConvertibl
             let address = rawValue["address"] as? UInt32,
             let nonceStateRaw = rawValue["nonceState"] as? NonceState.RawValue,
             let nonceState = NonceState(rawValue: nonceStateRaw),
-            let activatedAt = rawValue["activatedAt"] as? Date,
-            let expiresAt = rawValue["expiresAt"] as? Date,
             let piVersion = rawValue["piVersion"] as? String,
             let pmVersion = rawValue["pmVersion"] as? String,
             let lot = rawValue["lot"] as? UInt32,
@@ -225,13 +228,16 @@ public struct PodState: RawRepresentable, Equatable, CustomDebugStringConvertibl
         
         self.address = address
         self.nonceState = nonceState
-        self.activatedAt = activatedAt
-        self.expiresAt = expiresAt
         self.piVersion = piVersion
         self.pmVersion = pmVersion
         self.lot = lot
         self.tid = tid
-        
+
+
+        if let activatedAt = rawValue["activatedAt"] as? Date {
+            self.activatedAt = activatedAt
+        }
+
         if let suspended = rawValue["suspended"] as? Bool {
             self.suspended = suspended
         } else {
@@ -336,8 +342,6 @@ public struct PodState: RawRepresentable, Equatable, CustomDebugStringConvertibl
         var rawValue: RawValue = [
             "address": address,
             "nonceState": nonceState.rawValue,
-            "activatedAt": activatedAt,
-            "expiresAt": expiresAt,
             "piVersion": piVersion,
             "pmVersion": pmVersion,
             "lot": lot,
@@ -375,6 +379,10 @@ public struct PodState: RawRepresentable, Equatable, CustomDebugStringConvertibl
 
         if let primeFinishTime = primeFinishTime {
             rawValue["primeFinishTime"] = primeFinishTime
+        }
+
+        if let activatedAt = activatedAt {
+            rawValue["activatedAt"] = activatedAt
         }
 
         if configuredAlerts.count > 0 {
